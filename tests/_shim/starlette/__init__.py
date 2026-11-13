@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 
 class HTTPException(Exception):
@@ -28,6 +29,11 @@ class Request:
         for i in range(0, len(view), step):
             yield bytes(view[i : i + step])
 
+    async def json(self):
+        if not self._body:
+            raise json.JSONDecodeError("empty body", "", 0)
+        return json.loads(self._body.decode("utf-8"))
+
 
 class BackgroundTasks:
     def __init__(self):
@@ -39,3 +45,18 @@ class BackgroundTasks:
     def run_all(self) -> None:
         for func, args, kwargs in self.tasks:
             func(*args, **kwargs)
+
+
+class Response:
+    media_type = "application/json"
+
+    def __init__(self, content, status_code: int = 200, headers=None):
+        self.content = content
+        self.status_code = status_code
+        self.headers = headers or {}
+
+
+class JSONResponse(Response):
+    def __init__(self, content, status_code: int = 200, headers=None):
+        super().__init__(content, status_code, headers)
+        self.media_type = "application/json; charset=utf-8"

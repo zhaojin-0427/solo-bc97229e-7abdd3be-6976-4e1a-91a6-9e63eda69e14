@@ -18,6 +18,16 @@ MAX_LINE_BYTES = int(os.environ.get("ARCHIVE_MAX_LINE_BYTES", str(4 * 1024 * 102
 INSERT_BATCH = int(os.environ.get("ARCHIVE_INSERT_BATCH", "500"))
 SEARCH_LIMIT = 100
 
+# Withdrawal reclamation: how long a table drop waits for an in-flight search
+# to finish before the worker retries on its next tick, and the tick interval.
+RECLAIM_READ_WAIT_SECONDS = float(
+    os.environ.get("ARCHIVE_RECLAIM_READ_WAIT_SECONDS", "30")
+)
+RECLAIM_POLL_INTERVAL = float(
+    os.environ.get("ARCHIVE_RECLAIM_POLL_INTERVAL", "1.0")
+)
+WITHDRAWAL_ID_MAX_LEN = 200
+
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)

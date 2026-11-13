@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import queue
 from collections.abc import Iterator
@@ -21,8 +22,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
+from starlette.responses import JSONResponse
 
-from . import config, db, ingest, search
+from . import config, db, ingest, reclaim, search
 from .schemas import (
     DocumentInfo,
     Health,
@@ -30,6 +32,7 @@ from .schemas import (
     ReplacementAccepted,
     SearchResponse,
     VersionInfo,
+    WithdrawalReceipt,
 )
 
 logger = logging.getLogger("archive")
@@ -93,19 +96,54 @@ async def _stream_ingest(
 
 def _index_in_background(doc_id: str, vid: int, block_count: int) -> None:
     """Promote a fully ingested version; any failure keeps the old version."""
-    conn = db.get_conn()
-    try:
-        db.set_state(conn, vid, db.STATE_INDEXING)
-        # Indexes were built incrementally during ingestion; the tables are
-        # already durable. This step is the single atomic visibility switch.
-        db.activate_version(conn, doc_id, vid, block_count)
-        logger.info("document %r switched to version %s", doc_id, vid)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("background indexing failed for version %s", vid)
-        with contextlib.suppress(Exception):
-            db.fail_version(conn, vid, f"indexing failed: {exc}")
-    finally:
-        conn.close()
+    # Reclamation considers the whole stale execution (ingest + promotion);
+    # the guard is released when this function returns for any reason.
+    with reclaim.job_guard(vid):
+        conn = db.get_conn()
+        try:
+            # Epoch check first: a withdrawal may have happened while the upload
+            # was streaming, in which case the version is already `withdrawn` and
+            # we must neither change its state nor touch the catalog.
+            try:
+                doc = db.get_document(conn, doc_id)
+                ver = db.get_version(conn, vid)
+                if (
+                    doc is None
+                    or ver is None
+                    or ver["state"] == db.STATE_WITHDRAWN
+                    or int(ver["epoch"]) != int(doc["epoch"])
+                ):
+                    logger.info(
+                        "version %s of %r belongs to a withdrawn epoch; "
+                        "skipping activation",
+                        vid,
+                        doc_id,
+                    )
+                    return
+            except db.StaleVersionError:  # pragma: no cover - defensive
+                return
+
+            db.set_state(conn, vid, db.STATE_INDEXING)
+            # Indexes were built incrementally during ingestion; the tables are
+            # already durable. This step is the single atomic visibility switch.
+            try:
+                db.activate_version(conn, doc_id, vid, block_count)
+            except db.StaleVersionError:
+                # Withdrawal raced with this promotion; the reclaimer owns the
+                # tables from here on.
+                logger.info(
+                    "version %s of %r withdrawn during promotion; skipping activation",
+                    vid,
+                    doc_id,
+                )
+                return
+            logger.info("document %r switched to version %s", doc_id, vid)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("background indexing failed for version %s", vid)
+            with contextlib.suppress(Exception):
+                db.fail_version(conn, vid, f"indexing failed: {exc}")
+        finally:
+            conn.close()
 
 
 def create_app() -> FastAPI:
@@ -121,7 +159,11 @@ def create_app() -> FastAPI:
                 logger.warning("recovery: %s", msg)
         finally:
             conn.close()
+        # Resume any withdrawal whose reclamation was interrupted by a restart.
+        reclaim.worker.start()
+        reclaim.worker.wake()
         yield
+        reclaim.worker.stop()
 
     app = FastAPI(
         title="Archive OCR cross-page search API",
@@ -217,16 +259,24 @@ def create_app() -> FastAPI:
                 except RuntimeError as exc:
                     raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-                try:
-                    block_count = await _stream_ingest(
-                        conn, vid, request.stream()
-                    )
-                except ingest.IngestError as exc:
-                    db.fail_version(conn, vid, str(exc))
-                    raise HTTPException(status_code=400, detail=str(exc)) from exc
-                except OSError as exc:
-                    db.fail_version(conn, vid, str(exc))
-                    raise HTTPException(status_code=507, detail=str(exc)) from exc
+                # The reclaimer waits on this guard if the document is
+                # withdrawn mid-upload: the old job's tables are only dropped
+                # once ingestion has tailed out.
+                with reclaim.job_guard(vid):
+                    try:
+                        block_count = await _stream_ingest(
+                            conn, vid, request.stream()
+                        )
+                    except ingest.IngestError as exc:
+                        db.fail_version(conn, vid, str(exc))
+                        raise HTTPException(
+                            status_code=400, detail=str(exc)
+                        ) from exc
+                    except OSError as exc:
+                        db.fail_version(conn, vid, str(exc))
+                        raise HTTPException(
+                            status_code=507, detail=str(exc)
+                        ) from exc
             finally:
                 conn.close()
 
@@ -269,11 +319,152 @@ def create_app() -> FastAPI:
                     status_code=404,
                     detail="document not found or no searchable version yet",
                 )
-            try:
-                result = search.search(conn, vid, q)
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            # Hold the read for the whole query: a concurrent withdrawal may
+            # hide the document, but it cannot drop these tables until we finish.
+            with reclaim.read_guard(vid):
+                try:
+                    result = search.search(conn, vid, q)
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
             return SearchResponse(**result)
+        finally:
+            conn.close()
+
+    def _build_receipt(conn, withdrawal_id: str, replayed: bool) -> WithdrawalReceipt:
+        row = db.get_withdrawal(conn, withdrawal_id)
+        if row is None:
+            raise HTTPException(
+                status_code=404, detail=f"unknown withdrawal_id {withdrawal_id!r}"
+            )
+        items = [
+            {
+                "version_id": int(item["version_id"]),
+                "state": item["state"],
+                "updated_at": item["updated_at"],
+            }
+            for item in db.list_withdrawal_items(conn, withdrawal_id)
+        ]
+        return WithdrawalReceipt(
+            withdrawal_id=row["withdrawal_id"],
+            doc_id=row["doc_id"],
+            epoch=int(row["epoch"]),
+            state=row["state"],
+            replayed=replayed,
+            detail=row["detail"],
+            error=row["error"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            completed_at=row["completed_at"],
+            items=items,
+        )
+
+    @app.post(
+        "/documents/{doc_id}/withdrawals",
+        response_model=WithdrawalReceipt,
+        status_code=202,
+        tags=["withdrawals"],
+        responses={
+            404: {"description": "document not found"},
+            409: {"description": "withdrawal number already used by another document"},
+            400: {"description": "invalid withdrawal payload"},
+        },
+    )
+    async def withdraw_document(
+        doc_id: str, request: Request, background_tasks: BackgroundTasks
+    ):
+        """Withdraw (撤档) a document: take its OCR content offline.
+
+        Body: ``{"withdrawal_id": "<client-chosen unique 撤档号>"}``.
+
+        The document immediately disappears from ``GET /documents`` and fresh
+        searches return 404, while searches already running against the
+        previously selected version finish untouched. Re-submitting the same
+        withdrawal number returns the *first* receipt (idempotent). The same
+        ``doc_id`` can afterwards be re-uploaded; old upload jobs and old
+        receipts can never affect the new archive.
+        """
+        _validate_doc_id(doc_id)
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise HTTPException(
+                status_code=400, detail=f"invalid JSON body: {exc}"
+            ) from exc
+        if not isinstance(payload, dict) or not isinstance(
+            payload.get("withdrawal_id"), str
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="body must be a JSON object with a string 'withdrawal_id'",
+            )
+        withdrawal_id = payload["withdrawal_id"]
+        if not withdrawal_id or len(withdrawal_id) > config.WITHDRAWAL_ID_MAX_LEN:
+            raise HTTPException(
+                status_code=400, detail="invalid withdrawal_id"
+            )
+
+        conn = db.get_conn()
+        try:
+            existing = db.get_withdrawal(conn, withdrawal_id)
+            if existing is not None:
+                # Idempotency: the same withdrawal number always yields the
+                # first receipt, no matter how often it is retried.
+                if existing["doc_id"] != doc_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"withdrawal_id {withdrawal_id!r} already belongs to "
+                            f"document {existing['doc_id']!r}"
+                        ),
+                    )
+                receipt = _build_receipt(conn, withdrawal_id, replayed=True)
+                # A replay also nudges the worker in case cleanup had stalled.
+                background_tasks.add_task(reclaim.worker.wake)
+                return JSONResponse(
+                    receipt.dict(), status_code=200,
+                    headers={"content-type": "application/json; charset=utf-8"},
+                )
+
+            doc = db.get_document(conn, doc_id)
+            if doc is None:
+                raise HTTPException(
+                    status_code=404, detail=f"document {doc_id!r} not found"
+                )
+            if int(doc["is_withdrawn"]):
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"document {doc_id!r} is already withdrawn; re-upload it "
+                        "before withdrawing again"
+                    ),
+                )
+            try:
+                db.withdraw_document(conn, doc_id, withdrawal_id)
+            except RuntimeError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            receipt = _build_receipt(conn, withdrawal_id, replayed=False)
+        finally:
+            conn.close()
+
+        background_tasks.add_task(reclaim.process_pending)
+        background_tasks.add_task(reclaim.worker.wake)
+        return receipt
+
+    @app.get(
+        "/withdrawals/{withdrawal_id}",
+        response_model=WithdrawalReceipt,
+        tags=["withdrawals"],
+        responses={404: {"description": "unknown withdrawal number"}},
+    )
+    def get_withdrawal(withdrawal_id: str) -> WithdrawalReceipt:
+        """Look up a withdrawal receipt: reclaim state, scope items and errors."""
+        if not withdrawal_id or len(withdrawal_id) > config.WITHDRAWAL_ID_MAX_LEN:
+            raise HTTPException(status_code=400, detail="invalid withdrawal_id")
+        conn = db.get_conn()
+        try:
+            return _build_receipt(conn, withdrawal_id, replayed=False)
+        except HTTPException:
+            raise
         finally:
             conn.close()
 

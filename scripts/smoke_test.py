@@ -39,10 +39,11 @@ class _QuietHandler(WSGIRequestHandler):
         pass
 
 
-def http(method: str, url: str, data: bytes | None = None):
+def http(method: str, url: str, data: bytes | None = None,
+         content_type: str = "application/x-ndjson"):
     req = urllib.request.Request(
         url, data=data, method=method,
-        headers={"content-type": "application/x-ndjson"} if data else {},
+        headers={"content-type": content_type} if data is not None else {},
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -149,6 +150,90 @@ def main() -> int:
         # 9. unknown document
         status, _ = http("GET", f"{base}/documents/nope/search?q=x")
         check("unknown document returns 404", status == 404)
+
+        # 10. withdrawal workflow: withdraw ledger, verify disappearance and
+        #     receipt idempotency, reclaim completion, then same-id re-archive.
+        wid = "WD-SMOKE-001"
+        payload = json.dumps({"withdrawal_id": wid}).encode()
+        status, receipt = http(
+            "POST", f"{base}/documents/ledger/withdrawals", payload,
+            content_type="application/json",
+        )
+        check("withdrawal accepted with 202", status == 202, str(receipt))
+        scoped = sorted(i["version_id"] for i in receipt["items"])
+        check("receipt carries reclaim scope", len(scoped) >= 1, str(scoped))
+
+        # Idempotent replay: same withdrawal number -> 200 + first receipt.
+        status, replay = http(
+            "POST", f"{base}/documents/ledger/withdrawals", payload,
+            content_type="application/json",
+        )
+        check(
+            "duplicate withdrawal number replays first receipt",
+            status == 200 and replay["replayed"] is True
+            and replay["created_at"] == receipt["created_at"],
+            str(replay),
+        )
+        # Withdrawal number reused against another document is rejected.
+        other = json.dumps({"withdrawal_id": wid}).encode()
+        status, body = http(
+            "POST", f"{base}/documents/gazette/withdrawals", other,
+            content_type="application/json",
+        )
+        check("withdrawal number collision returns 409", status == 409, str(body))
+
+        # Document gone from catalog and fresh searches 404.
+        status, docs = http("GET", f"{base}/documents")
+        check(
+            "withdrawn document absent from list",
+            "ledger" not in {d["doc_id"] for d in docs},
+        )
+        status, _ = http("GET", f"{base}/documents/ledger/search?q=x")
+        check("search on withdrawn document returns 404", status == 404)
+
+        # Wait for background reclaim to finish; receipt query reports state.
+        deadline_seconds = 15.0
+        started = __import__("time").time()
+        final_receipt = None
+        while __import__("time").time() - started < deadline_seconds:
+            status, final_receipt = http("GET", f"{base}/withdrawals/{wid}")
+            if final_receipt["state"] == "completed":
+                break
+            __import__("time").sleep(0.2)
+        check(
+            "withdrawal receipt reaches completed",
+            status == 200 and final_receipt is not None
+            and final_receipt["state"] == "completed",
+            json.dumps(final_receipt, ensure_ascii=False),
+        )
+        check(
+            "all reclaim items done",
+            all(i["state"] == "done" for i in final_receipt["items"]),
+        )
+
+        # Same doc id re-upload: a new generation, fully searchable again.
+        ledger_payload = (ROOT / "demo" / "ledger.ndjson").read_bytes()
+        status, reup = http("PUT", f"{base}/documents/ledger", ledger_payload)
+        check("same-id re-upload after withdrawal accepted", status == 202, str(reup))
+        __import__("time").sleep(1.0)
+        status, docs = http("GET", f"{base}/documents")
+        check(
+            "re-archived document back in catalog",
+            "ledger" in {d["doc_id"] for d in docs},
+        )
+        status, body = http(
+            "GET",
+            f"{base}/documents/ledger/search?q="
+            + urllib.parse.quote("鹽稅"),
+        )
+        check("re-archived document searchable", status == 200 and body["result_count"] >= 1)
+        # The old receipt still reports only the old generation's scope.
+        status, old_receipt = http("GET", f"{base}/withdrawals/{wid}")
+        check(
+            "old receipt never scopes the new archive",
+            sorted(i["version_id"] for i in old_receipt["items"]) == scoped
+            and reup["version_id"] not in scoped,
+        )
     finally:
         httpd.shutdown()
         shutil.rmtree(WORKDIR, ignore_errors=True)

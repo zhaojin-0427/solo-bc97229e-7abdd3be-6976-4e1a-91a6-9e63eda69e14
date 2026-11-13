@@ -12,6 +12,7 @@ import re
 from urllib.parse import parse_qs
 
 from starlette import BackgroundTasks, HTTPException, Request
+from starlette.responses import JSONResponse
 
 
 def _serialize(value):
@@ -83,6 +84,9 @@ class FastAPI:
             background = kwargs.get("background_tasks")
             if background is not None:
                 background.run_all()
+            if isinstance(result, JSONResponse):
+                # Endpoint overrode the default status code (e.g. 200 replay).
+                return result.status_code, result.content
             return status_code, result
         raise HTTPException(404, f"no route for {method} {path}")
 

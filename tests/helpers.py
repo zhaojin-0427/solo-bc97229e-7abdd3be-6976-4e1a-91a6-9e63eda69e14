@@ -26,7 +26,8 @@ def make_app():
 
 
 def wsgi_request(app, method: str, path: str, body: bytes = b"",
-                 query: dict | None = None) -> tuple[int, dict]:
+                 query: dict | None = None,
+                 content_type: str = "application/x-ndjson") -> tuple[int, dict]:
     environ: dict = {}
     setup_testing_defaults(environ)
     environ["REQUEST_METHOD"] = method
@@ -34,6 +35,7 @@ def wsgi_request(app, method: str, path: str, body: bytes = b"",
     if query:
         environ["QUERY_STRING"] = urlencode(query)
     environ["CONTENT_LENGTH"] = str(len(body))
+    environ["CONTENT_TYPE"] = content_type
     environ["wsgi.input"] = io.BytesIO(body)
     captured: dict = {}
 
@@ -43,6 +45,10 @@ def wsgi_request(app, method: str, path: str, body: bytes = b"",
 
     raw = b"".join(app(environ, start_response))
     return captured["status"], json.loads(raw.decode("utf-8"))
+
+
+def json_body(payload: dict) -> bytes:
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
 def ndjson(records: list[dict]) -> bytes:

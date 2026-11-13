@@ -70,6 +70,35 @@ class ReplacementAccepted(BaseModel):
     detail: str
 
 
+class WithdrawalItem(BaseModel):
+    version_id: int = Field(..., description="pre-withdrawal version whose tables are reclaimed")
+    state: str = Field(..., description="pending (awaiting drop) or done (tables removed)")
+    updated_at: float
+
+
+class WithdrawalReceipt(BaseModel):
+    withdrawal_id: str = Field(..., description="the submitted withdrawal number (撤档号)")
+    doc_id: str
+    epoch: int = Field(..., description="withdrawn document generation; re-archives start a new epoch")
+    state: str = Field(
+        ...,
+        description="accepted -> reclaiming -> completed (or failed, auto-retried)",
+    )
+    replayed: bool = Field(
+        ..., description="true when the withdrawal number was already known (idempotent replay)"
+    )
+    detail: str | None
+    error: str | None = Field(
+        None, description="last reclaim error, if any; cleared on the successful retry"
+    )
+    created_at: float
+    updated_at: float
+    completed_at: float | None
+    items: list[WithdrawalItem] = Field(
+        ..., description="durable reclaim scope: every pre-withdrawal version"
+    )
+
+
 class RecoveryReport(BaseModel):
     recovered: list[str]
 

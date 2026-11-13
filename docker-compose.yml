@@ -31,5 +31,22 @@ services:
       - archive-data:/data
     profiles: ["demo"]
 
+  # One-shot withdrawal walkthrough: withdraws the gazette, polls the receipt
+  # to completion and re-archives the same document id with corrected content.
+  # Run after the seeder:
+  #   docker compose --profile demo run --rm seed
+  #   docker compose --profile demo run --rm withdraw-demo
+  withdraw-demo:
+    image: archive-ocr-search:latest
+    command: ["python", "-I", "scripts/demo_withdrawal.py"]
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      ARCHIVE_API_BASE: http://api:8000
+    volumes:
+      - archive-data:/data
+    profiles: ["demo"]
+
 volumes:
   archive-data:
